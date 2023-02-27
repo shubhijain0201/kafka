@@ -1228,7 +1228,8 @@ class Partition(val topicPartition: TopicPartition,
       val (replica, logReadInfo) = inReadLock(leaderIsrUpdateLock) {
         val localLog = localLogWithEpochOrThrow(
           fetchPartitionData.currentLeaderEpoch,
-          fetchParams.fetchOnlyLeader
+          true
+          //fetchParams.fetchOnlyLeader
         )
         val replica = followerReplicaOrThrow(
           fetchParams.replicaId,
@@ -1253,7 +1254,8 @@ class Partition(val topicPartition: TopicPartition,
       inReadLock(leaderIsrUpdateLock) {
         val localLog = localLogWithEpochOrThrow(
           fetchPartitionData.currentLeaderEpoch,
-          fetchParams.fetchOnlyLeader
+          true
+          //fetchParams.fetchOnlyLeader
         )
         readFromLocalLog(localLog)
       }

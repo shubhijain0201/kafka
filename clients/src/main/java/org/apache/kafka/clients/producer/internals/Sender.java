@@ -235,7 +235,7 @@ public class Sender implements Runnable {
      */
     @Override
     public void run() {
-        log.debug("Starting Kafka producer I/O thread.");
+        log.info("Starting Kafka producer I/O thread.");
 
         // main loop, runs until close is called
         while (running) {
@@ -406,7 +406,7 @@ public class Sender implements Runnable {
         pollTimeout = Math.min(pollTimeout, this.accumulator.nextExpiryTimeMs() - now);
         pollTimeout = Math.max(pollTimeout, 0);
         if (!result.readyNodes.isEmpty()) {
-            log.trace("Nodes with data ready to send: {}", result.readyNodes);
+            //log.info("Nodes with data ready to send: {}", result.readyNodes);
             // if some partitions are already ready to be sent, the select time would be 0;
             // otherwise if some partition already has some data accumulated but not ready yet,
             // the select time will be the time difference between now and its linger expiry time;
@@ -561,7 +561,7 @@ public class Sender implements Runnable {
             for (ProducerBatch batch : batches.values())
                 completeBatch(batch, new ProduceResponse.PartitionResponse(Errors.UNSUPPORTED_VERSION), correlationId, now);
         } else {
-            log.trace("Received produce response from node {} with correlation id {}", response.destination(), correlationId);
+            log.info("Received produce response from node {} with correlation id {}", response.destination(), correlationId);
             // if we have a response, parse it
             if (response.hasResponse()) {
                 // Sender should exercise PartitionProduceResponse rather than ProduceResponse.PartitionResponse
@@ -569,6 +569,7 @@ public class Sender implements Runnable {
                 ProduceResponse produceResponse = (ProduceResponse) response.responseBody();
                 produceResponse.data().responses().forEach(r -> r.partitionResponses().forEach(p -> {
                     TopicPartition tp = new TopicPartition(r.name(), p.index());
+                    log.info("Topic: {} and partition written to {}", tp.topic(), tp.partition());
                     ProduceResponse.PartitionResponse partResp = new ProduceResponse.PartitionResponse(
                             Errors.forCode(p.errorCode()),
                             p.baseOffset(),
@@ -581,6 +582,8 @@ public class Sender implements Runnable {
                             p.errorMessage());
                     ProducerBatch batch = batches.get(tp);
                     completeBatch(batch, partResp, correlationId, now);
+                    log.info("Return values: baseOffset= " + p.baseOffset() + ", logAppendTime = " + p.logAppendTimeMs() +
+                            "logStartOffset= " + p.logStartOffset() + ", destination: " + response.destination());
                 }));
                 this.sensors.recordLatency(response.destination(), response.requestLatencyMs());
             } else {
@@ -786,18 +789,25 @@ public class Sender implements Runnable {
      * Transfer the record batches into a list of produce requests on a per-node basis
      */
     private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
-        for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
-            sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, entry.getValue());
+        int count = 0;
+        for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet()) {
+            count++;
+            //log.info("*********** destination: {} ************** for count {}", entry.getKey());
+            sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, entry.getValue(), count);
+        }
     }
 
     /**
      * Create a produce request from the given record batches
      */
-    private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
+    private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches, int count) {
+        //log.info("destination: {}, count: {}", destination, count);
         if (batches.isEmpty())
             return;
 
         final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
+
+        log.info("Partition records: {}", recordsByPartition.toString());
 
         // find the minimum magic version used when creating the record sets
         byte minUsedMagic = apiVersions.maxUsableProduceMagic();
@@ -806,8 +816,10 @@ public class Sender implements Runnable {
                 minUsedMagic = batch.magic();
         }
         ProduceRequestData.TopicProduceDataCollection tpd = new ProduceRequestData.TopicProduceDataCollection();
+        int partition = -1;
         for (ProducerBatch batch : batches) {
             TopicPartition tp = batch.topicPartition;
+            partition = tp.partition();
             MemoryRecords records = batch.records();
 
             // down convert if necessary to the minimum magic used. In general, there can be a delay between the time
@@ -835,6 +847,9 @@ public class Sender implements Runnable {
             transactionalId = transactionManager.transactionalId();
         }
 
+        log.info("Setting the values: acks= " + acks + ", timeout= " + timeout + ", transactionalId= " + transactionalId +
+                ", topicData= " + tpd);
+
         ProduceRequest.Builder requestBuilder = ProduceRequest.forMagic(minUsedMagic,
                 new ProduceRequestData()
                         .setAcks(acks)
@@ -847,13 +862,14 @@ public class Sender implements Runnable {
         ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
                 requestTimeoutMs, callback);
         client.send(clientRequest, now);
-        log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
+        log.info("Sent produce request to node {}: {} for partition {}", nodeId, requestBuilder, partition);
     }
 
     /**
      * Wake up the selector associated with this send thread
      */
     public void wakeup() {
+        log.info("************* waking up the sender!!!! ********");
         this.client.wakeup();
     }
 

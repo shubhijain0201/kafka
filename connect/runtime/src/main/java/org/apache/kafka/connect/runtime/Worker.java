@@ -1371,6 +1371,7 @@ public class Worker {
             Map<String, Object> producerProps = exactlyOnceSourceTaskProducerConfigs(
                     id, config, sourceConfig, connectorClass,
                     connectorClientConfigOverridePolicy, kafkaClusterId);
+            log.info("******** Creating producer ********");
             KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(producerProps);
 
             // Create a topic admin that the task will use for its offsets topic and, potentially, automatic topic creation

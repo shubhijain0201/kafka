@@ -521,6 +521,8 @@ public class NetworkClient implements KafkaClient {
             log.debug("Sending {} request with header {} and timeout {} to node {}: {}",
                 clientRequest.apiKey(), header, clientRequest.requestTimeoutMs(), destination, request);
         }
+        log.info("Sending {} request with header {} and timeout {} to node {}: {}",
+                clientRequest.apiKey(), header, clientRequest.requestTimeoutMs(), destination, request);
         Send send = request.toSend(header);
         InFlightRequest inFlightRequest = new InFlightRequest(
                 clientRequest,
@@ -880,6 +882,8 @@ public class NetworkClient implements KafkaClient {
                     req.header.apiKey(), req.destination, req.header, response);
             }
 
+            //log.info("Received {} response from node {} for request with header {}: {}",
+                    //req.header.apiKey(), req.destination, req.header, response);
             // If the received response includes a throttle delay, throttle the connection.
             maybeThrottle(response, req.header.apiVersion(), req.destination, now);
             if (req.isInternalRequest && response instanceof MetadataResponse)

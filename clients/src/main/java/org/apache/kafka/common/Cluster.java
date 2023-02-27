@@ -16,6 +16,9 @@
  */
 package org.apache.kafka.common;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -48,6 +51,8 @@ public final class Cluster {
     private final ClusterResource clusterResource;
     private final Map<String, Uuid> topicIds;
     private final Map<Uuid, String> topicNames;
+
+    private final Logger log = LoggerFactory.getLogger(Cluster.class);
 
     /**
      * Create a new cluster with the given id, nodes and partitions
@@ -128,6 +133,7 @@ public final class Cluster {
         Map<Integer, List<PartitionInfo>> tmpPartitionsByNode = new HashMap<>(nodes.size());
         for (Node node : nodes) {
             tmpNodesById.put(node.id(), node);
+            log.info("Cluster: node {} and nodeid {}", node, node.id());
             // Populate the map here to make it easy to add the partitions per node efficiently when iterating over
             // the partitions
             tmpPartitionsByNode.put(node.id(), new ArrayList<>());
@@ -149,8 +155,23 @@ public final class Cluster {
 
             // If it is known, its node information should be available
             List<PartitionInfo> partitionsForNode = Objects.requireNonNull(tmpPartitionsByNode.get(p.leader().id()));
+            log.info("Cluster partitionsForNode data : {} for leader {}", partitionsForNode.toString(), p.leader().id());
+            log.info("Cluster: before adding partition data size {}", partitionsForNode.size());
             partitionsForNode.add(p);
         }
+
+        log.info("Cluster: Partition information for replica 100 {} ", tmpPartitionsByNode.get(100));
+
+        for (PartitionInfo p : partitions) {
+            Node[] replicas = p.replicas();
+
+            for (Node node : replicas) {
+                List<PartitionInfo> partitionInfoList = Objects.requireNonNull(tmpPartitionsByNode.get(node.id()));
+                partitionInfoList.add(p);
+            }
+        }
+
+        log.info("Cluster: Partition information for replica 100 {} ", tmpPartitionsByNode.get(100));
 
         // Update the values of `tmpPartitionsByNode` to contain unmodifiable lists
         for (Map.Entry<Integer, List<PartitionInfo>> entry : tmpPartitionsByNode.entrySet()) {
@@ -275,6 +296,16 @@ public final class Cluster {
             return null;
         else
             return info.leader();
+    }
+
+    public Node[] replicasFor(TopicPartition topicPartition) {
+        PartitionInfo info = partitionsByTopicPartition.get(topicPartition);
+
+        if (info == null) {
+            return null;
+        } else {
+            return info.inSyncReplicas();
+        }
     }
 
     /**

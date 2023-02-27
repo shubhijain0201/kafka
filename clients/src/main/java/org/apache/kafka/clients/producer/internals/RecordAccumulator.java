@@ -33,7 +33,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.kafka.clients.ApiVersions;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.ProducerIdAndEpoch;
+import org.apache.kafka.common.utils.CopyOnWriteMap;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
@@ -50,9 +53,6 @@ import org.apache.kafka.common.record.MemoryRecordsBuilder;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.record.TimestampType;
-import org.apache.kafka.common.utils.CopyOnWriteMap;
-import org.apache.kafka.common.utils.LogContext;
-import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 
 /**
@@ -727,8 +727,16 @@ public class RecordAccumulator {
                     }
                 }
 
+
                 nextReadyCheckDelayMs = batchReady(nowMs, exhausted, part, leader, waitedTimeMs, backingOff,
                     full, nextReadyCheckDelayMs, readyNodes);
+
+                Node[] replicas = cluster.replicasFor(part);
+
+                for (Node replica : replicas) {
+                    //log.info("Fetch the replica {} for the partition {}", replica.id(), part.partition());
+                    readyNodes.add(replica);
+                }
             }
         }
 
@@ -770,6 +778,8 @@ public class RecordAccumulator {
             final String topic = topicInfoEntry.getKey();
             nextReadyCheckDelayMs = partitionReady(cluster, nowMs, topic, topicInfoEntry.getValue(), nextReadyCheckDelayMs, readyNodes, unknownLeaderTopics);
         }
+
+        //log.info("Accumulator: Ready nodes {}", readyNodes.toString());
         return new ReadyCheckResult(readyNodes, nextReadyCheckDelayMs, unknownLeaderTopics);
     }
 
@@ -832,81 +842,86 @@ public class RecordAccumulator {
         List<ProducerBatch> ready = new ArrayList<>();
         /* to make starvation less likely each node has it's own drainIndex */
         int drainIndex = getDrainIndex(node.idString());
-        int start = drainIndex = drainIndex % parts.size();
-        do {
-            PartitionInfo part = parts.get(drainIndex);
-            TopicPartition tp = new TopicPartition(part.topic(), part.partition());
-            updateDrainIndex(node.idString(), drainIndex);
-            drainIndex = (drainIndex + 1) % parts.size();
-            // Only proceed if the partition has no in-flight batches.
-            if (isMuted(tp))
-                continue;
+        int start = -10;
+        if (parts.size() != 0)
+            start = drainIndex = drainIndex % parts.size();
 
-            Deque<ProducerBatch> deque = getDeque(tp);
-            if (deque == null)
-                continue;
-
-            final ProducerBatch batch;
-            synchronized (deque) {
-                // invariant: !isMuted(tp,now) && deque != null
-                ProducerBatch first = deque.peekFirst();
-                if (first == null)
+        if (start != -10) {
+            do {
+                PartitionInfo part = parts.get(drainIndex);
+                TopicPartition tp = new TopicPartition(part.topic(), part.partition());
+                updateDrainIndex(node.idString(), drainIndex);
+                drainIndex = (drainIndex + 1) % parts.size();
+                // Only proceed if the partition has no in-flight batches.
+                if (isMuted(tp))
                     continue;
 
-                // first != null
-                boolean backoff = first.attempts() > 0 && first.waitedTimeMs(now) < retryBackoffMs;
-                // Only drain the batch if it is not during backoff period.
-                if (backoff)
+                Deque<ProducerBatch> deque = getDeque(tp);
+                if (deque == null)
                     continue;
 
-                if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
-                    // there is a rare case that a single batch size is larger than the request size due to
-                    // compression; in this case we will still eventually send this batch in a single request
-                    break;
-                } else {
-                    if (shouldStopDrainBatchesForPartition(first, tp))
+                final ProducerBatch batch;
+                synchronized (deque) {
+                    // invariant: !isMuted(tp,now) && deque != null
+                    ProducerBatch first = deque.peekFirst();
+                    if (first == null)
+                        continue;
+
+                    // first != null
+                    boolean backoff = first.attempts() > 0 && first.waitedTimeMs(now) < retryBackoffMs;
+                    // Only drain the batch if it is not during backoff period.
+                    if (backoff)
+                        continue;
+
+                    if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
+                        // there is a rare case that a single batch size is larger than the request size due to
+                        // compression; in this case we will still eventually send this batch in a single request
                         break;
+                    } else {
+                        if (shouldStopDrainBatchesForPartition(first, tp))
+                            break;
+                    }
+
+                    batch = deque.pollFirst();
+
+                    boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
+                    ProducerIdAndEpoch producerIdAndEpoch =
+                            transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
+                    if (producerIdAndEpoch != null && !batch.hasSequence()) {
+                        // If the producer id/epoch of the partition do not match the latest one
+                        // of the producer, we update it and reset the sequence. This should be
+                        // only done when all its in-flight batches have completed. This is guarantee
+                        // in `shouldStopDrainBatchesForPartition`.
+                        transactionManager.maybeUpdateProducerIdAndEpoch(batch.topicPartition);
+
+                        // If the batch already has an assigned sequence, then we should not change the producer id and
+                        // sequence number, since this may introduce duplicates. In particular, the previous attempt
+                        // may actually have been accepted, and if we change the producer id and sequence here, this
+                        // attempt will also be accepted, causing a duplicate.
+                        //
+                        // Additionally, we update the next sequence number bound for the partition, and also have
+                        // the transaction manager track the batch so as to ensure that sequence ordering is maintained
+                        // even if we receive out of order responses.
+                        batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
+                        transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
+                        log.debug("Assigned producerId {} and producerEpoch {} to batch with base sequence " +
+                                        "{} being sent to partition {}", producerIdAndEpoch.producerId,
+                                producerIdAndEpoch.epoch, batch.baseSequence(), tp);
+
+                        transactionManager.addInFlightBatch(batch);
+                    }
                 }
 
-                batch = deque.pollFirst();
+                // the rest of the work by processing outside the lock
+                // close() is particularly expensive
 
-                boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
-                ProducerIdAndEpoch producerIdAndEpoch =
-                    transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
-                if (producerIdAndEpoch != null && !batch.hasSequence()) {
-                    // If the producer id/epoch of the partition do not match the latest one
-                    // of the producer, we update it and reset the sequence. This should be
-                    // only done when all its in-flight batches have completed. This is guarantee
-                    // in `shouldStopDrainBatchesForPartition`.
-                    transactionManager.maybeUpdateProducerIdAndEpoch(batch.topicPartition);
+                batch.close();
+                size += batch.records().sizeInBytes();
+                ready.add(batch);
 
-                    // If the batch already has an assigned sequence, then we should not change the producer id and
-                    // sequence number, since this may introduce duplicates. In particular, the previous attempt
-                    // may actually have been accepted, and if we change the producer id and sequence here, this
-                    // attempt will also be accepted, causing a duplicate.
-                    //
-                    // Additionally, we update the next sequence number bound for the partition, and also have
-                    // the transaction manager track the batch so as to ensure that sequence ordering is maintained
-                    // even if we receive out of order responses.
-                    batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
-                    transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
-                    log.debug("Assigned producerId {} and producerEpoch {} to batch with base sequence " +
-                            "{} being sent to partition {}", producerIdAndEpoch.producerId,
-                        producerIdAndEpoch.epoch, batch.baseSequence(), tp);
-
-                    transactionManager.addInFlightBatch(batch);
-                }
-            }
-
-            // the rest of the work by processing outside the lock
-            // close() is particularly expensive
-
-            batch.close();
-            size += batch.records().sizeInBytes();
-            ready.add(batch);
-
-            batch.drained(now);
-        } while (start != drainIndex);
+                batch.drained(now);
+            } while (start != drainIndex);
+        }
         return ready;
     }
 
